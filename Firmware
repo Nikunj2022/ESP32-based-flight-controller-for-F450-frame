@@ -1,0 +1,271 @@
+/************************************************************************************
+ * ESP32 Quadcopter Flight Controller Code
+ * 
+ * Based on the user-provided schematic with critical pin corrections.
+ * This code is for educational and experimental purposes.
+ * 
+ * ALWAYS TEST WITHOUT PROPELLERS FIRST.
+ ************************************************************************************/
+
+//===================================================================================
+// 1. LIBRARIES
+//===================================================================================
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <ESP32Servo.h>
+
+//===================================================================================
+// 2. PIN DEFINITIONS & CONFIGURATION
+//===================================================================================
+// -- I2C Pins for MPU6050
+// SCL -> GPIO 22
+// SDA -> GPIO 21
+
+// -- Radio Receiver PWM Input Pins
+#define RC_CH1_PIN 34 // Roll
+#define RC_CH2_PIN 35 // Pitch
+#define RC_CH3_PIN 32 // Throttle
+#define RC_CH4_PIN 33 // Yaw
+#define RC_CH5_PIN 25 // AUX 1 (Used for Arming/Disarming)
+
+// -- ESC PWM Output Pins (SCHEMATIC CORRECTED!)
+#define MOTOR1_PIN 13 // Motor 1: Front-Right (CCW)
+#define MOTOR2_PIN 12 // Motor 2: Rear-Right  (CW)
+#define MOTOR3_PIN 14  // Motor 3: Rear-Left   (CCW) -- MOVED FROM D27
+#define MOTOR4_PIN 27  // Motor 4: Front-Left  (CW)  -- MOVED FROM D14
+
+// -- Status LED
+#define LED_PIN 15
+
+// -- Battery Voltage Monitoring
+#define BATT_VOLTAGE_PIN 36 // VP pin (ADC1_CH0)
+#define R1_DIV 100000.0f
+#define R2_DIV 36000.0f
+
+// -- ESC Signal Configuration
+#define MIN_THROTTLE_US 1000 // Minimum signal ESCs will accept
+#define MAX_THROTTLE_US 2000 // Maximum signal ESCs will accept
+#define MOTOR_IDLE_US   1100 // Speed for armed motors at zero throttle
+
+//===================================================================================
+// 3. GLOBAL VARIABLES
+//===================================================================================
+// -- System Objects
+Adafruit_MPU6050 mpu;
+Servo motor1, motor2, motor3, motor4;
+
+// -- Radio Control Inputs (in microseconds, e.g., 1000-2000)
+volatile unsigned long rc_ch1_val, rc_ch2_val, rc_ch3_val, rc_ch4_val, rc_ch5_val;
+unsigned long rc_ch1_start, rc_ch2_start, rc_ch3_start, rc_ch4_start, rc_ch5_start;
+
+// -- IMU & Orientation Variables
+float gyro_x_cal = 0, gyro_y_cal = 0, gyro_z_cal = 0;
+float angle_pitch = 0, angle_roll = 0;
+float angle_pitch_acc = 0, angle_roll_acc = 0;
+
+// -- PID Controller Variables
+// ** THESE VALUES MUST BE TUNED FOR YOUR SPECIFIC DRONE! **
+float pid_p_gain_roll = 2.0;   // Proportional gain
+float pid_i_gain_roll = 0.04;  // Integral gain
+float pid_d_gain_roll = 20.0;  // Derivative gain
+float pid_p_gain_pitch = pid_p_gain_roll; // Pitch gains are often the same as roll
+float pid_i_gain_pitch = pid_i_gain_roll;
+float pid_d_gain_pitch = pid_d_gain_roll;
+float pid_p_gain_yaw = 6.0;    // Yaw gains are tuned separately
+float pid_i_gain_yaw = 0.05;
+float pid_d_gain_yaw = 0.13;
+
+float pid_error_temp;
+float pid_i_mem_roll = 0, pid_i_mem_pitch = 0, pid_i_mem_yaw = 0;
+float pid_last_roll_d_error = 0, pid_last_pitch_d_error = 0, pid_last_yaw_d_error = 0;
+float pid_output_roll, pid_output_pitch, pid_output_yaw;
+
+// -- Flight Control Variables
+float desired_angle_roll = 0, desired_angle_pitch = 0, desired_rate_yaw = 0;
+int throttle;
+bool is_armed = false;
+
+// -- Loop Timing
+unsigned long loop_timer;
+const int LOOP_TIME_US = 2500; // Loop time in microseconds (400Hz)
+
+//===================================================================================
+// 4. SETUP - INITIALIZATION ROUTINE
+//===================================================================================
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    
+    pinMode(LED_PIN, OUTPUT);
+    
+    // --- Initialize MPU6050 ---
+    if (!mpu.begin()) {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1) { // Trap MCU if IMU is not found
+            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            delay(100);
+        }
+    }
+    Serial.println("MPU6050 Found!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    // --- Calibrate Gyroscope ---
+    Serial.println("Calibrating Gyro... Do not move the drone.");
+    for (int i = 0; i < 2000; i++) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+        gyro_x_cal += g.gyro.x;
+        gyro_y_cal += g.gyro.y;
+        gyro_z_cal += g.gyro.z;
+        delay(1);
+    }
+    gyro_x_cal /= 2000;
+    gyro_y_cal /= 2000;
+    gyro_z_cal /= 2000;
+    Serial.println("Calibration Done.");
+
+    // --- Setup Receiver Pins using Interrupts (more reliable than pulseIn)
+    // This part is more complex to set up. For simplicity, we will stick to pulseIn in the main loop.
+    // In a real project, consider moving to PCINT or using a serial receiver (SBUS/IBUS).
+    pinMode(RC_CH1_PIN, INPUT_PULLUP);
+    pinMode(RC_CH2_PIN, INPUT_PULLUP);
+    pinMode(RC_CH3_PIN, INPUT_PULLUP);
+    pinMode(RC_CH4_PIN, INPUT_PULLUP);
+    pinMode(RC_CH5_PIN, INPUT_PULLUP);
+
+    // --- Attach ESCs and Arming Sequence ---
+    // Allow allocation of all timers
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+    
+    motor1.attach(MOTOR1_PIN, MIN_THROTTLE_US, MAX_THROTTLE_US);
+    motor2.attach(MOTOR2_PIN, MIN_THROTTLE_US, MAX_THROTTLE_US);
+    motor3.attach(MOTOR3_PIN, MIN_THROTTLE_US, MAX_THROTTLE_US);
+    motor4.attach(MOTOR4_PIN, MIN_THROTTLE_US, MAX_THROTTLE_US);
+
+    Serial.println("Arming ESCs... Sending min throttle.");
+    motor1.writeMicroseconds(MIN_THROTTLE_US);
+    motor2.writeMicroseconds(MIN_THROTTLE_US);
+    motor3.writeMicroseconds(MIN_THROTTLE_US);
+    motor4.writeMicroseconds(MIN_THROTTLE_US);
+    delay(2000); // Wait for ESCs to initialize
+    
+    Serial.println("Setup Complete. Waiting for arm signal.");
+    loop_timer = micros(); // Initialize loop timer
+}
+
+
+//===================================================================================
+// 5. MAIN LOOP - FLIGHT CONTROLLER
+//===================================================================================
+void loop() {
+    // --- 1. Read IMU and Process Orientation ---
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    float gyro_x = g.gyro.x - gyro_x_cal;
+    float gyro_y = g.gyro.y - gyro_y_cal;
+    float gyro_z = g.gyro.z - gyro_z_cal;
+    
+    // Complementary Filter to get stable angle estimates
+    float dt = (micros() - loop_timer) / 1000000.0f;
+    angle_pitch += gyro_y * dt;
+    angle_roll += gyro_x * dt;
+    
+    angle_pitch_acc = atan2(a.acceleration.x, sqrt(pow(a.acceleration.y, 2) + pow(a.acceleration.z, 2))) * 180 / PI;
+    angle_roll_acc = atan2(a.acceleration.y, sqrt(pow(a.acceleration.x, 2) + pow(a.acceleration.z, 2))) * -180 / PI;
+
+    angle_pitch = angle_pitch * 0.98 + angle_pitch_acc * 0.02;
+    angle_roll = angle_roll * 0.98 + angle_roll_acc * 0.02;
+
+    // --- 2. Read Radio Receiver ---
+    // Using pulseIn is simple but can be slow. A better method is interrupts or a serial protocol.
+    rc_ch1_val = pulseIn(RC_CH1_PIN, HIGH, 25000); // Roll
+    rc_ch2_val = pulseIn(RC_CH2_PIN, HIGH, 25000); // Pitch
+    rc_ch3_val = pulseIn(RC_CH3_PIN, HIGH, 25000); // Throttle
+    rc_ch4_val = pulseIn(RC_CH4_PIN, HIGH, 25000); // Yaw
+    rc_ch5_val = pulseIn(RC_CH5_PIN, HIGH, 25000); // Arming switch
+
+    // --- 3. Map Radio Inputs to Setpoints ---
+    // Map RC values from ~1000-2000 to a desired angle range (e.g., -25 to +25 degrees)
+    desired_angle_roll = map(rc_ch1_val, 1000, 2000, -25, 25);
+    desired_angle_pitch = map(rc_ch2_val, 1000, 2000, -25, 25);
+    desired_rate_yaw = map(rc_ch4_val, 1000, 2000, -150, 150); // Desired yaw rotation rate in deg/s
+    throttle = rc_ch3_val;
+
+    // --- 4. PID Controller Calculation ---
+    // ROLL
+    pid_error_temp = angle_roll - desired_angle_roll;
+    pid_i_mem_roll += pid_i_gain_roll * pid_error_temp;
+    if(pid_i_mem_roll > 400) pid_i_mem_roll = 400; else if(pid_i_mem_roll < -400) pid_i_mem_roll = -400;
+    pid_output_roll = pid_p_gain_roll * pid_error_temp + pid_i_mem_roll + pid_d_gain_roll * (pid_error_temp - pid_last_roll_d_error);
+    pid_last_roll_d_error = pid_error_temp;
+
+    // PITCH
+    pid_error_temp = angle_pitch - desired_angle_pitch;
+    pid_i_mem_pitch += pid_i_gain_pitch * pid_error_temp;
+    if(pid_i_mem_pitch > 400) pid_i_mem_pitch = 400; else if(pid_i_mem_pitch < -400) pid_i_mem_pitch = -400;
+    pid_output_pitch = pid_p_gain_pitch * pid_error_temp + pid_i_mem_pitch + pid_d_gain_pitch * (pid_error_temp - pid_last_pitch_d_error);
+    pid_last_pitch_d_error = pid_error_temp;
+
+    // YAW
+    pid_error_temp = (gyro_z * 180 / PI) - desired_rate_yaw;
+    pid_i_mem_yaw += pid_i_gain_yaw * pid_error_temp;
+    if(pid_i_mem_yaw > 400) pid_i_mem_yaw = 400; else if(pid_i_mem_yaw < -400) pid_i_mem_yaw = -400;
+    pid_output_yaw = pid_p_gain_yaw * pid_error_temp + pid_i_mem_yaw + pid_d_gain_yaw * (pid_error_temp - pid_last_yaw_d_error);
+    pid_last_yaw_d_error = pid_error_temp;
+
+    // --- 5. Arming Logic ---
+    if (rc_ch5_val > 1500 && throttle < 1100) {
+        is_armed = true;
+        digitalWrite(LED_PIN, HIGH);
+    }
+    if (rc_ch5_val < 1500) {
+        is_armed = false;
+        digitalWrite(LED_PIN, LOW);
+    }
+    
+    // --- 6. Motor Mixing & Output ---
+    int motor1_speed, motor2_speed, motor3_speed, motor4_speed;
+
+    if (is_armed) {
+        if (throttle > 1100) { // Flying
+            motor1_speed = throttle - pid_output_pitch + pid_output_roll - pid_output_yaw; // Front-Right
+            motor2_speed = throttle + pid_output_pitch + pid_output_roll + pid_output_yaw; // Rear-Right
+            motor3_speed = throttle + pid_output_pitch - pid_output_roll - pid_output_yaw; // Rear-Left
+            motor4_speed = throttle - pid_output_pitch - pid_output_roll + pid_output_yaw; // Front-Left
+        } else { // Armed, but throttle is at zero
+            motor1_speed = MOTOR_IDLE_US;
+            motor2_speed = MOTOR_IDLE_US;
+            motor3_speed = MOTOR_IDLE_US;
+            motor4_speed = MOTOR_IDLE_US;
+        }
+
+        // Constrain motor speeds to valid range
+        motor1_speed = constrain(motor1_speed, MOTOR_IDLE_US, MAX_THROTTLE_US);
+        motor2_speed = constrain(motor2_speed, MOTOR_IDLE_US, MAX_THROTTLE_US);
+        motor3_speed = constrain(motor3_speed, MOTOR_IDLE_US, MAX_THROTTLE_US);
+        motor4_speed = constrain(motor4_speed, MOTOR_IDLE_US, MAX_THROTTLE_US);
+
+    } else { // Disarmed
+        motor1_speed = MIN_THROTTLE_US;
+        motor2_speed = MIN_THROTTLE_US;
+        motor3_speed = MIN_THROTTLE_US;
+        motor4_speed = MIN_THROTTLE_US;
+    }
+    
+    // Write final values to ESCs
+    motor1.writeMicroseconds(motor1_speed);
+    motor2.writeMicroseconds(motor2_speed);
+    motor3.writeMicroseconds(motor3_speed);
+    motor4.writeMicroseconds(motor4_speed);
+
+    // --- 7. Maintain Loop Frequency ---
+    while(micros() - loop_timer < LOOP_TIME_US);
+    loop_timer = micros();
+}
